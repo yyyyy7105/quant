@@ -83,6 +83,29 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backtests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    strategy        TEXT NOT NULL,
+    params_json     TEXT NOT NULL,
+    start_date      TEXT,
+    end_date        TEXT,
+    init_cash       REAL NOT NULL,
+    fees            REAL NOT NULL,
+    total_return    REAL,
+    annualized_return REAL,
+    sharpe          REAL,
+    max_drawdown    REAL,
+    win_rate        REAL,
+    num_trades      INTEGER,
+    avg_trade_pct   REAL,
+    bh_total_return REAL,
+    bh_max_drawdown REAL,
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_backtests_ticker ON backtests(ticker, created_at);
+
 CREATE TABLE IF NOT EXISTS fetch_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     op          TEXT NOT NULL,                -- 'fetch_daily' | 'pull_earnings' | etc.

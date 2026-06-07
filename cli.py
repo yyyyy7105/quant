@@ -30,8 +30,10 @@ import getpass
 import sys
 
 from quant import auth
+from quant import backtest as bt
 from quant import events as ev
 from quant import prices as px
+from quant.strategies import STRATEGIES
 from quant import tickers as tk
 from quant import trades as tr
 
@@ -147,11 +149,66 @@ def build_parser() -> argparse.ArgumentParser:
     da.add_argument("--tickers", nargs="+", default=None)
     da.add_argument("--threshold", type=float, default=2.0)
 
+    # ---- backtest -------------------------------------------------------
+    b = sub.add_parser("backtest", help="Run / list / inspect backtests")
+    bsub = b.add_subparsers(dest="backtest_cmd", required=True)
+
+    br = bsub.add_parser("run", help="Run a strategy on a ticker")
+    br.add_argument("ticker")
+    br.add_argument("--strategy", required=True, choices=list(STRATEGIES.keys()))
+    br.add_argument("--start", default=None, help="ISO yyyy-mm-dd")
+    br.add_argument("--end", default=None, help="ISO yyyy-mm-dd")
+    br.add_argument("--init-cash", type=float, default=10000.0)
+    br.add_argument("--fees", type=float, default=0.001)
+    br.add_argument("--notes", default=None)
+    # Unknown --<param> flags are passed to the strategy
+
+    bl = bsub.add_parser("list", help="List saved backtests")
+    bl.add_argument("--ticker", default=None)
+
+    bsh = bsub.add_parser("show", help="Print one saved backtest")
+    bsh.add_argument("backtest_id", type=int)
+
+    bd = bsub.add_parser("delete", help="Delete a saved backtest")
+    bd.add_argument("backtest_id", type=int)
+
     return p
 
 
+def _parse_strategy_params(extras: list[str], strategy: str) -> dict:
+    """Pull --<param> <value> pairs out of the extras list, matching the strategy spec."""
+    spec = STRATEGIES[strategy]
+    out: dict = {}
+    i = 0
+    while i < len(extras):
+        tok = extras[i]
+        if not tok.startswith("--"):
+            raise SystemExit(f"Unexpected token {tok!r}")
+        key = tok[2:].replace("-", "_")
+        if key not in spec.params:
+            raise SystemExit(f"Unknown param --{key} for strategy {strategy}. "
+                             f"Known: {list(spec.params)}")
+        if i + 1 >= len(extras):
+            raise SystemExit(f"Missing value for --{key}")
+        val = extras[i + 1]
+        # Cast based on default type
+        default = spec.params[key].default
+        out[key] = int(val) if isinstance(default, int) else float(val)
+        i += 2
+    # Fill defaults for unspecified params
+    for k, ps in spec.params.items():
+        out.setdefault(k, ps.default)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args, extras = parser.parse_known_args(argv)
+    # `extras` is only meaningful for `backtest run` (dynamic --<param> flags).
+    # For any other command, treat unknown args as an error.
+    if extras and not (getattr(args, "cmd", None) == "backtest"
+                       and getattr(args, "backtest_cmd", None) == "run"):
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
 
     # ---- user -----------------------------------------------------------
     if args.cmd == "user":
@@ -276,6 +333,49 @@ def main(argv: list[str] | None = None) -> int:
         if args.event_cmd == "detect-anomalies":
             ev.detect_anomalies(_resolve_tickers(args.tickers), threshold=args.threshold)
             return 0
+
+    # ---- backtest -------------------------------------------------------
+    if args.cmd == "backtest":
+        if args.backtest_cmd == "run":
+            params = _parse_strategy_params(extras, args.strategy)
+            result = bt.run_backtest(
+                ticker=args.ticker.upper(), strategy=args.strategy, params=params,
+                start=args.start, end=args.end,
+                init_cash=args.init_cash, fees=args.fees, notes=args.notes,
+            )
+            m = result.metrics
+            print(f"[OK]   backtest #{result.backtest_id} saved")
+            print(f"  ticker:        {result.ticker}")
+            print(f"  strategy:      {result.strategy}  params={result.params}")
+            print(f"  total_return:  {m['total_return']*100:+.2f}%   (B&H: {m['bh_total_return']*100:+.2f}%)")
+            print(f"  ann. return:   {m['annualized_return']*100:+.2f}%")
+            print(f"  sharpe:        {m['sharpe']:.2f}")
+            print(f"  max drawdown:  -{m['max_drawdown']*100:.2f}%   (B&H: -{m['bh_max_drawdown']*100:.2f}%)")
+            print(f"  win rate:      {m['win_rate']*100:.2f}%")
+            print(f"  # trades:      {int(m['num_trades'])}")
+            return 0
+        if args.backtest_cmd == "list":
+            df = bt.list_backtests(ticker=args.ticker)
+            if df.empty:
+                print("(no backtests)")
+            else:
+                cols = ["id", "created_at", "ticker", "strategy", "params",
+                        "total_return", "sharpe", "max_drawdown", "num_trades"]
+                print(df[cols].to_string(index=False))
+            return 0
+        if args.backtest_cmd == "show":
+            cfg = bt.get_backtest(args.backtest_id)
+            if cfg is None:
+                print(f"[WARN] backtest #{args.backtest_id} not found")
+                return 1
+            import json as _json
+            print(_json.dumps(cfg, indent=2, default=str))
+            return 0
+        if args.backtest_cmd == "delete":
+            ok = bt.delete_backtest(args.backtest_id)
+            print(f"[OK]   backtest #{args.backtest_id} deleted" if ok
+                  else f"[WARN] backtest #{args.backtest_id} not found")
+            return 0 if ok else 1
 
     print(f"unknown command: {args}", file=sys.stderr)
     return 1

@@ -17,21 +17,26 @@ import streamlit as st
 # Streamlit caches imported modules across script reruns. If a quant.* submodule
 # is edited while the server is running, the in-memory copy goes stale (you'd see
 # AttributeError for newly added functions). Force-reload them every script run.
-import quant.db, quant.metrics, quant.oplog, quant.prices, quant.tickers, quant.trades, quant.events, quant.auth
+import quant.db, quant.metrics, quant.oplog, quant.prices, quant.tickers, quant.trades, quant.events, quant.auth, quant.strategies, quant.backtest
 for _m in (
     quant.db, quant.metrics, quant.oplog, quant.prices,
     quant.tickers, quant.trades, quant.events, quant.auth,
+    quant.strategies, quant.backtest,
 ):
     importlib.reload(_m)
 
 from quant import auth
 from quant import oplog
 from quant import tickers as tk
+from quant.backtest import (
+    delete_backtest, get_backtest, list_backtests, run_backtest,
+)
 from quant.events import (
     VALID_KINDS, add_event, delete_event, list_events,
     pull_all as pull_all_events, update_event,
 )
 from quant.prices import fetch_daily, list_tickers, load_daily
+from quant.strategies import STRATEGIES
 from quant.trades import (
     add_trade, delete_trade, list_trades, positions, update_trade,
 )
@@ -56,7 +61,7 @@ if auth.has_users() and not st.session_state.get("authenticated"):
     st.caption("Register via CLI: `uv run python cli.py user add <username>`")
     st.stop()
 
-PAGES = ["Portfolio", "Ticker view", "Trade log", "Events feed", "Tickers"]
+PAGES = ["Portfolio", "Ticker view", "Backtest", "Trade log", "Events feed", "Tickers"]
 
 EVENT_STYLE = {
     "earnings": ("★", "#9b59b6"),
@@ -303,14 +308,19 @@ def render_trade_log() -> None:
             c5, c6 = st.columns(2)
             t_fees = c5.number_input("Fees", min_value=0.0, value=0.0, step=0.01)
             t_tags = c6.text_input("Tags (comma-separated)")
+            _now = datetime.now()
+            c7, c8 = st.columns(2)
+            t_date = c7.date_input("Date", value=_now.date())
+            t_time = c8.time_input("Time", value=_now.time().replace(microsecond=0))
             t_notes = st.text_area("Notes", "")
             if st.form_submit_button("Add trade", type="primary"):
                 if not t_ticker or t_qty <= 0 or t_price <= 0:
                     st.error("Ticker, quantity, and price are required.")
                 else:
+                    t_ts = datetime.combine(t_date, t_time)
                     add_trade(
                         ticker=t_ticker, side=t_side, qty=t_qty, price=t_price,
-                        fees=t_fees, notes=t_notes or None, tags=t_tags or None,
+                        ts=t_ts, fees=t_fees, notes=t_notes or None, tags=t_tags or None,
                     )
                     st.success(f"Added {t_side} {t_qty} {t_ticker} @ {t_price}")
                     st.rerun()
@@ -512,6 +522,201 @@ def render_tickers() -> None:
             st.rerun()
 
 
+def render_backtest() -> None:
+    st.title("Backtest")
+    st.caption("Run a strategy on historical data, compare to buy-and-hold, save the result.")
+
+    tickers = list_tickers()
+    if not tickers:
+        st.info("No price data. Add tickers on the Tickers page first.")
+        return
+
+    # ---- config form --------------------------------------------------
+    cfg_col, params_col = st.columns([1, 1])
+    with cfg_col:
+        st.subheader("Configuration")
+        ticker = st.selectbox("Ticker", tickers, key="bt_ticker")
+        strategy_key = st.selectbox(
+            "Strategy",
+            list(STRATEGIES.keys()),
+            format_func=lambda k: STRATEGIES[k].name,
+            key="bt_strategy",
+        )
+        spec = STRATEGIES[strategy_key]
+        st.caption(spec.description)
+
+        df_for_range = load_daily(ticker)
+        if df_for_range.empty:
+            st.warning("No data for this ticker.")
+            return
+        min_d, max_d = df_for_range.index.min().date(), df_for_range.index.max().date()
+        start, end = st.slider(
+            "Date range", min_value=min_d, max_value=max_d,
+            value=(min_d, max_d), format="YYYY-MM-DD", key="bt_range",
+        )
+        cash_col, fees_col = st.columns(2)
+        init_cash = cash_col.number_input("Initial cash", min_value=100.0, value=10000.0, step=100.0, key="bt_cash")
+        fees = fees_col.number_input("Fees (decimal)", min_value=0.0, max_value=0.05, value=0.001, step=0.0005, format="%.4f", key="bt_fees")
+        notes = st.text_input("Notes (optional)", key="bt_notes")
+
+    with params_col:
+        st.subheader("Parameters")
+        params: dict = {}
+        for pname, pspec in spec.params.items():
+            params[pname] = st.slider(
+                pname, min_value=float(pspec.min), max_value=float(pspec.max),
+                value=float(pspec.default), step=float(pspec.step),
+                key=f"bt_param_{strategy_key}_{pname}",
+            )
+            # Convert to int if the spec was integer-valued
+            if isinstance(pspec.default, int) and isinstance(pspec.step, int):
+                params[pname] = int(params[pname])
+
+    run_btn = st.button("Run backtest", type="primary")
+
+    if run_btn:
+        try:
+            with st.spinner("Running backtest..."):
+                result = run_backtest(
+                    ticker=ticker, strategy=strategy_key, params=params,
+                    start=str(start), end=str(end),
+                    init_cash=init_cash, fees=fees,
+                    notes=notes or None,
+                )
+            st.session_state["bt_last_result"] = result
+            st.success(f"Backtest #{result.backtest_id} saved.")
+        except Exception as e:
+            st.error(f"Backtest failed: {e}")
+
+    result = st.session_state.get("bt_last_result")
+    if result is not None:
+        _render_backtest_result(result)
+
+    # ---- saved runs ---------------------------------------------------
+    st.markdown("---")
+    with st.expander("Saved runs", expanded=False):
+        runs = list_backtests(ticker)
+        if runs.empty:
+            st.caption("No saved runs for this ticker yet.")
+        else:
+            show_cols = [
+                "id", "created_at", "strategy", "params",
+                "total_return", "sharpe", "max_drawdown",
+                "win_rate", "num_trades", "bh_total_return", "notes",
+            ]
+            st.dataframe(runs[show_cols], width='stretch', hide_index=True)
+            c1, c2 = st.columns([1, 1])
+            view_id = c1.number_input("Backtest ID to view", min_value=0, step=1, value=0, key="bt_view_id")
+            cview, cdel = c2.columns(2)
+            if cview.button("Load run"):
+                cfg = get_backtest(int(view_id))
+                if cfg is None:
+                    st.warning(f"Backtest #{view_id} not found.")
+                else:
+                    with st.spinner("Re-running stored config..."):
+                        result = run_backtest(
+                            ticker=cfg["ticker"], strategy=cfg["strategy"],
+                            params=cfg["params"], start=cfg["start"], end=cfg["end"],
+                            init_cash=cfg["init_cash"], fees=cfg["fees"],
+                            notes=cfg["notes"], persist=False,
+                        )
+                    st.session_state["bt_last_result"] = result
+                    st.rerun()
+            if cdel.button("Delete run", type="secondary"):
+                if delete_backtest(int(view_id)):
+                    st.success(f"Deleted backtest #{view_id}")
+                    st.rerun()
+                else:
+                    st.warning(f"Backtest #{view_id} not found.")
+
+
+def _render_backtest_result(result) -> None:
+    st.markdown("---")
+    st.subheader(f"Results — {result.ticker} / {STRATEGIES[result.strategy].name}")
+    st.caption(f"Params: {result.params}")
+
+    m = result.metrics
+    cols = st.columns(5)
+    cols[0].metric(
+        "Total return", f"{m['total_return']*100:.2f}%",
+        delta=f"{(m['total_return']-m['bh_total_return'])*100:.2f}% vs B&H",
+    )
+    cols[1].metric("Sharpe", f"{m['sharpe']:.2f}")
+    cols[2].metric("Max drawdown", f"{m['max_drawdown']*100:.2f}%")
+    cols[3].metric("Win rate", f"{m['win_rate']*100:.2f}%")
+    cols[4].metric("# Trades", f"{int(m['num_trades'])}")
+
+    # Equity curve vs B&H
+    eq_fig = go.Figure()
+    eq_fig.add_trace(go.Scatter(
+        x=result.equity_curve.index, y=result.equity_curve.values,
+        mode="lines", name="Strategy", line=dict(color="#3498db", width=2),
+    ))
+    eq_fig.add_trace(go.Scatter(
+        x=result.bh_curve.index, y=result.bh_curve.values,
+        mode="lines", name="Buy & hold", line=dict(color="#95a5a6", width=2, dash="dash"),
+    ))
+    eq_fig.update_layout(
+        title="Equity curve", height=380,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(eq_fig, width='stretch')
+
+    # Drawdown chart
+    peak = result.equity_curve.cummax()
+    dd = (result.equity_curve - peak) / peak
+    dd_fig = go.Figure()
+    dd_fig.add_trace(go.Scatter(
+        x=dd.index, y=dd.values * 100, mode="lines",
+        fill="tozeroy", line=dict(color="#e74c3c"), name="Drawdown %",
+    ))
+    dd_fig.update_layout(
+        title="Drawdown (%)", height=260,
+        margin=dict(l=10, r=10, t=40, b=10),
+        yaxis=dict(ticksuffix="%"),
+    )
+    st.plotly_chart(dd_fig, width='stretch')
+
+    # Trade markers on price
+    df = load_daily(result.ticker,
+                    start=str(result.equity_curve.index.min().date()),
+                    end=str(result.equity_curve.index.max().date()))
+    if not df.empty and not result.trades.empty:
+        price_fig = go.Figure()
+        price_fig.add_trace(go.Candlestick(
+            x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name=result.ticker, showlegend=False,
+        ))
+        t = result.trades
+        if "entry_date" in t.columns:
+            price_fig.add_trace(go.Scatter(
+                x=t["entry_date"], y=t.get("entry_price"),
+                mode="markers", name="Entry",
+                marker=dict(symbol="triangle-up", size=12, color="#27ae60", line=dict(width=1, color="white")),
+            ))
+        if "exit_date" in t.columns:
+            price_fig.add_trace(go.Scatter(
+                x=t["exit_date"], y=t.get("exit_price"),
+                mode="markers", name="Exit",
+                marker=dict(symbol="triangle-down", size=12, color="#c0392b", line=dict(width=1, color="white")),
+            ))
+        price_fig.update_layout(
+            title="Price with trade markers", height=460,
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(price_fig, width='stretch')
+
+    # Trade list
+    st.subheader("Trades")
+    if result.trades.empty:
+        st.caption("No trades.")
+    else:
+        st.dataframe(result.trades, width='stretch', hide_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -519,6 +724,8 @@ if page == "Portfolio":
     render_portfolio()
 elif page == "Ticker view":
     render_ticker_view()
+elif page == "Backtest":
+    render_backtest()
 elif page == "Trade log":
     render_trade_log()
 elif page == "Events feed":

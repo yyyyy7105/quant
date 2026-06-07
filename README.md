@@ -1,6 +1,6 @@
 # quant
 
-Personal stock tracker and trade journal. Fetches daily price data, computes technical indicators, logs your trades, auto-pulls events (earnings, dividends, news, price anomalies), and surfaces everything in a local Streamlit dashboard.
+Personal stock tracker, trade journal, **and backtester**. Fetches daily price data, computes technical indicators, logs your trades, auto-pulls events (earnings, dividends, news, price anomalies), runs strategy backtests with `vectorbt`, and surfaces everything in a local Streamlit dashboard.
 
 ## Stack
 
@@ -10,6 +10,7 @@ Personal stock tracker and trade journal. Fetches daily price data, computes tec
 | Data source | `yfinance` (Yahoo Finance, free, no API key) |
 | Storage | SQLite (`data/quant.db`) |
 | Dashboard | Streamlit + Plotly |
+| Backtesting | `vectorbt` (vectorized, fast on daily bars) |
 
 ---
 
@@ -129,6 +130,39 @@ Event kinds: `manual · earnings · dividend · news · anomaly`
 
 ---
 
+### `backtest` — run a strategy on historical data
+
+Built-in strategies (more can be added in `quant/strategies.py`):
+
+| Key | Strategy | Params |
+|---|---|---|
+| `golden_cross` | Buy when short SMA crosses above long SMA; sell on reverse | `short`, `long` |
+| `rsi_mean_reversion` | Buy when RSI_14 drops below `lower`; sell when above `upper` | `lower`, `upper` |
+| `bollinger_breakout` | Buy on upper-band breakout; sell on lower-band breakdown | `window`, `n_std` |
+
+```bash
+# Run with defaults
+uv run python cli.py backtest run NOK --strategy golden_cross
+
+# Custom params (any --<param> matching the strategy)
+uv run python cli.py backtest run NOK --strategy golden_cross --short 20 --long 50
+uv run python cli.py backtest run RKLB --strategy rsi_mean_reversion --lower 25 --upper 75
+uv run python cli.py backtest run NOK --strategy bollinger_breakout --window 20 --n_std 2.5
+
+# Restrict window, change cash/fees
+uv run python cli.py backtest run NOK --strategy golden_cross --start 2024-01-01 --end 2026-01-01 --init-cash 50000 --fees 0.0015
+
+# List / inspect / delete
+uv run python cli.py backtest list                # all runs
+uv run python cli.py backtest list --ticker NOK   # filter
+uv run python cli.py backtest show 7              # print one run's full config
+uv run python cli.py backtest delete 7
+```
+
+Each run is saved to `backtests` table with config + metrics (total return, Sharpe, max drawdown, win rate, etc.) plus a buy-and-hold benchmark for the same window — so you can compare runs later.
+
+---
+
 ## Dashboard
 
 ```bash
@@ -148,6 +182,7 @@ The dashboard mirrors all CLI capabilities (and is the only place to edit/delete
 |---|---|
 | **Portfolio** | Open positions, cost basis, market value, unrealized P&L, allocation pie |
 | **Ticker view** | Candlestick chart with buy/sell markers, event overlays (earnings ★, dividend $, news, anomaly ⚠), SMA/EMA toggles, scrollable date window, clickable event links in table below |
+| **Backtest** | Pick ticker + strategy, tune params via sliders, run vectorbt backtest. Shows equity curve vs buy-and-hold, drawdown chart, trade markers, full metrics. Saved runs list at the bottom for comparison. |
 | **Trade log** | Add new trades, edit cells inline (including date/time), tick rows + Delete selected, filter by ticker/tag |
 | **Events feed** | Add manual events, edit/delete, filter by kind/ticker |
 | **Tickers** | Watch list management — add (with initial fetch), remove, see row counts |
@@ -184,6 +219,8 @@ quant/
     events.py         add_event, pull_*, detect_anomalies
     oplog.py          operation timestamps + data freshness helpers
     tickers.py        watch list registry (add/remove/list)
+    strategies.py     built-in backtest strategies (signal generators)
+    backtest.py       run_backtest() wrapping vectorbt + result persistence
   data/
     quant.db          all data (prices, trades, events)
   pyproject.toml
@@ -201,6 +238,7 @@ quant/
 | `events` | `id, ts, ticker, kind, title, body, source_url, metadata` |
 | `tickers` | `ticker, added_at, active, notes` |
 | `fetch_log` | `id, op, ts, details` |
+| `backtests` | `id, created_at, ticker, strategy, params_json, init_cash, fees, total_return, sharpe, max_drawdown, win_rate, num_trades, bh_total_return, ...` |
 
 Query directly with any SQLite client:
 ```bash
