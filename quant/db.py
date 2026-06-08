@@ -21,16 +21,11 @@ CREATE TABLE IF NOT EXISTS prices_daily (
     low             REAL,
     close           REAL,
     volume          INTEGER,
-    sma_20          REAL,
-    sma_50          REAL,
-    sma_200         REAL,
-    ema_20          REAL,
-    daily_return    REAL,
-    volatility_20   REAL,
-    rsi_14          REAL,
-    vol_sma_20      REAL,
+    market          TEXT NOT NULL DEFAULT 'US',  -- 'US' | 'CN'
     PRIMARY KEY (ticker, date)
 );
+-- NOTE: technical indicators (sma/ema/rsi/macd/kdj/boll) are computed on the fly
+-- in quant.metrics at load time, NOT stored here. Only raw OHLCV is persisted.
 
 CREATE TABLE IF NOT EXISTS prices_intraday (
     ticker      TEXT NOT NULL,
@@ -72,7 +67,8 @@ CREATE TABLE IF NOT EXISTS tickers (
     ticker      TEXT PRIMARY KEY,
     added_at    TEXT NOT NULL,
     active      INTEGER NOT NULL DEFAULT 1,   -- 0 = removed (history kept)
-    notes       TEXT
+    notes       TEXT,
+    market      TEXT NOT NULL DEFAULT 'US'    -- 'US' | 'CN'
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -114,18 +110,66 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 );
 CREATE INDEX IF NOT EXISTS idx_fetch_log_op ON fetch_log(op, ts);
 
+CREATE TABLE IF NOT EXISTS formulas (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    expr        TEXT NOT NULL,                -- MyTT-format boolean expression
+    description TEXT,
+    created_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_tt ON trades(ticker, ts);
 CREATE INDEX IF NOT EXISTS idx_events_tt ON events(ticker, ts);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 """
 
 
+_LEGACY_INDICATOR_COLS = {
+    "sma_20", "sma_50", "sma_200", "ema_20",
+    "daily_return", "volatility_20", "rsi_14", "vol_sma_20",
+}
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+
     # Migration: drop total_cost column from trades if it still exists
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
-    if "total_cost" in cols:
+    tcols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    if "total_cost" in tcols:
         conn.execute("ALTER TABLE trades DROP COLUMN total_cost")
+
+    # Migration: prices_daily now stores raw OHLCV only (indicators computed on
+    # the fly) + a `market` column. Rebuild the table if legacy indicator columns
+    # are still present; otherwise just add `market` if missing.
+    pcols = {row[1] for row in conn.execute("PRAGMA table_info(prices_daily)").fetchall()}
+    if pcols & _LEGACY_INDICATOR_COLS:
+        conn.executescript(
+            """
+            CREATE TABLE prices_daily_new (
+                ticker  TEXT NOT NULL,
+                date    TEXT NOT NULL,
+                open    REAL,
+                high    REAL,
+                low     REAL,
+                close   REAL,
+                volume  INTEGER,
+                market  TEXT NOT NULL DEFAULT 'US',
+                PRIMARY KEY (ticker, date)
+            );
+            INSERT INTO prices_daily_new (ticker, date, open, high, low, close, volume, market)
+                SELECT ticker, date, open, high, low, close, volume, 'US' FROM prices_daily;
+            DROP TABLE prices_daily;
+            ALTER TABLE prices_daily_new RENAME TO prices_daily;
+            """
+        )
+    elif "market" not in pcols:
+        conn.execute("ALTER TABLE prices_daily ADD COLUMN market TEXT NOT NULL DEFAULT 'US'")
+
+    # Migration: add `market` to tickers if missing
+    tkcols = {row[1] for row in conn.execute("PRAGMA table_info(tickers)").fetchall()}
+    if "market" not in tkcols:
+        conn.execute("ALTER TABLE tickers ADD COLUMN market TEXT NOT NULL DEFAULT 'US'")
+
     conn.commit()
 
 

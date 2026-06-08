@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("tickers", nargs="+")
     ta.add_argument("--period", default="5y", help="History window for initial fetch")
     ta.add_argument("--notes", default=None)
+    ta.add_argument("--market", default="US", choices=["US", "CN", "us", "cn"],
+                    help="Market: US (yfinance) or CN (akshare, A股)")
 
     tr_ = tsub.add_parser("remove", help="Remove ticker(s) from the watch list (history kept)")
     tr_.add_argument("tickers", nargs="+")
@@ -82,10 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     tsub.add_parser("list", help="Show all watched tickers with price stats")
 
     # ---- fetch (daily) --------------------------------------------------
-    f = sub.add_parser("fetch", help="Refresh daily OHLCV + metrics for watched tickers")
+    f = sub.add_parser("fetch", help="Refresh daily OHLCV for watched tickers")
     f.add_argument("--tickers", nargs="+", default=None,
                    help="Override tickers (default: managed list)")
     f.add_argument("--period", default="5y")
+    f.add_argument("--market", default="US", choices=["US", "CN", "us", "cn"],
+                   help="Market: US (yfinance) or CN (akshare, A股)")
 
     # ---- fetch-intraday -------------------------------------------------
     fi = sub.add_parser("fetch-intraday", help="Pull intraday bars around an event window")
@@ -255,12 +259,13 @@ def main(argv: list[str] | None = None) -> int:
     # ---- ticker ---------------------------------------------------------
     if args.cmd == "ticker":
         if args.ticker_cmd == "add":
+            market = args.market.upper()
             for ticker in args.tickers:
                 t = ticker.upper()
-                is_new = tk.add(t, notes=args.notes)
+                is_new = tk.add(t, notes=args.notes, market=market)
                 action = "Added" if is_new else "Re-activated"
-                print(f"[OK]   {action} {t} — fetching history...")
-                px.fetch_daily([t], period=args.period)
+                print(f"[OK]   {action} {t} ({market}) — fetching history...")
+                px.fetch_daily([t], period=args.period, market=market)
             return 0
         if args.ticker_cmd == "remove":
             for ticker in args.tickers:
@@ -278,7 +283,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- fetch ----------------------------------------------------------
     if args.cmd == "fetch":
-        px.fetch_daily(_resolve_tickers(args.tickers), period=args.period)
+        market = args.market.upper()
+        if args.tickers:
+            tickers = [t.upper() for t in args.tickers]
+        else:
+            tickers = tk.get_active(market=market) or _FALLBACK_TICKERS
+        px.fetch_daily(tickers, period=args.period, market=market)
         return 0
     if args.cmd == "fetch-intraday":
         px.fetch_intraday(args.ticker, args.start, args.end, args.interval)

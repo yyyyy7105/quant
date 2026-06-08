@@ -13,9 +13,10 @@ import pandas as pd
 from .db import connect
 
 
-def add(ticker: str, notes: str | None = None) -> bool:
+def add(ticker: str, notes: str | None = None, market: str = "US") -> bool:
     """Register a ticker as active. Returns True if newly added, False if re-activated."""
     t = ticker.upper()
+    market = market.upper()
     now = datetime.now().isoformat(timespec="seconds")
     with connect() as conn:
         existing = conn.execute(
@@ -23,15 +24,15 @@ def add(ticker: str, notes: str | None = None) -> bool:
         ).fetchone()
         if existing is None:
             conn.execute(
-                "INSERT INTO tickers (ticker, added_at, active, notes) VALUES (?, ?, 1, ?)",
-                (t, now, notes),
+                "INSERT INTO tickers (ticker, added_at, active, notes, market) VALUES (?, ?, 1, ?, ?)",
+                (t, now, notes, market),
             )
             conn.commit()
             return True
         else:
             conn.execute(
-                "UPDATE tickers SET active = 1, notes = COALESCE(?, notes) WHERE ticker = ?",
-                (notes, t),
+                "UPDATE tickers SET active = 1, notes = COALESCE(?, notes), market = ? WHERE ticker = ?",
+                (notes, market, t),
             )
             conn.commit()
             return False
@@ -49,12 +50,19 @@ def remove(ticker: str) -> bool:
         return True
 
 
-def get_active() -> list[str]:
-    """Return tickers currently marked active, in alphabetical order."""
+def get_active(market: str | None = None) -> list[str]:
+    """Return tickers currently marked active, in alphabetical order.
+
+    传 market 则只返回该市场('US'/'CN')的活跃标的。
+    """
+    q = "SELECT ticker FROM tickers WHERE active = 1"
+    params: list = []
+    if market:
+        q += " AND market = ?"
+        params.append(market.upper())
+    q += " ORDER BY ticker"
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT ticker FROM tickers WHERE active = 1 ORDER BY ticker"
-        ).fetchall()
+        rows = conn.execute(q, params).fetchall()
     return [r["ticker"] for r in rows]
 
 
@@ -65,6 +73,7 @@ def summary() -> pd.DataFrame:
             """
             SELECT
                 t.ticker,
+                t.market,
                 t.active,
                 t.added_at,
                 t.notes,

@@ -3,7 +3,10 @@
     "allow": [
       "Bash(uv init *)",
       "Bash(uv add *)",
-      "Bash(uv run *)"
+      "Bash(uv run *)",
+      "Bash(uv pip *)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 uv run python _smoke.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 uv run python -c ' *)"
     ]
   }
 }

@@ -11,6 +11,8 @@ import yfinance as yf
 from .db import connect
 from .metrics import add_metrics
 from .oplog import record as record_op
+from .sources import cn as cn_source
+from .sources import us as us_source
 
 # yfinance intraday history limits (approx)
 INTRADAY_MAX_DAYS = {
@@ -24,29 +26,35 @@ INTRADAY_MAX_DAYS = {
     "1h": 730,
 }
 
-_DAILY_COLS = [
-    "ticker", "date", "open", "high", "low", "close", "volume",
-    "sma_20", "sma_50", "sma_200", "ema_20",
-    "daily_return", "volatility_20", "rsi_14", "vol_sma_20",
-]
+# prices_daily 仅存原始 OHLCV + market;指标在 load_daily 时即时计算
+_DAILY_COLS = ["ticker", "date", "open", "high", "low", "close", "volume", "market"]
 
 
-def fetch_daily(tickers: Iterable[str], period: str = "5y") -> dict[str, int]:
-    """Fetch daily OHLCV + metrics for each ticker and upsert into `prices_daily`.
+def fetch_daily(
+    tickers: Iterable[str], period: str = "5y", market: str = "US"
+) -> dict[str, int]:
+    """按市场拉取日线原始 OHLCV 并写入 `prices_daily`(不再落库指标)。
 
-    Returns {ticker: rows_written}.
+    market='US' 走 yfinance,'CN' 走 akshare(前复权)。返回 {ticker: rows_written}。
     """
+    market = market.upper()
+    source = cn_source if market == "CN" else us_source
+
     written: dict[str, int] = {}
     with connect() as conn:
         for ticker in tickers:
-            df = yf.Ticker(ticker).history(period=period, interval="1d")
-            if df.empty:
-                print(f"[WARN] {ticker}: no data returned")
+            try:
+                df = source.fetch_history(ticker, period=period)
+            except Exception as e:  # 单个标的失败不影响其它
+                print(f"[WARN] {ticker} ({market}): fetch failed: {e}")
+                written[ticker] = 0
+                continue
+            if df is None or df.empty:
+                print(f"[WARN] {ticker} ({market}): no data returned")
                 written[ticker] = 0
                 continue
 
-            df = add_metrics(df)
-            rows = _daily_to_rows(ticker, df)
+            rows = _daily_to_rows(ticker, df, market)
             conn.executemany(
                 f"INSERT OR REPLACE INTO prices_daily ({','.join(_DAILY_COLS)}) "
                 f"VALUES ({','.join('?' * len(_DAILY_COLS))})",
@@ -55,9 +63,9 @@ def fetch_daily(tickers: Iterable[str], period: str = "5y") -> dict[str, int]:
             conn.commit()
             written[ticker] = len(rows)
             print(
-                f"[OK]   {ticker}: {len(rows)} rows "
+                f"[OK]   {ticker} ({market}): {len(rows)} rows "
                 f"{df.index[0].date()} -> {df.index[-1].date()}, "
-                f"latest Close={df['Close'].iloc[-1]:.2f}"
+                f"latest Close={df['close'].iloc[-1]:.2f}"
             )
     total_rows = sum(written.values())
     record_op("fetch_daily", f"{len(written)} tickers, {total_rows} rows")
@@ -128,50 +136,56 @@ def load_daily(
     start: str | None = None,
     end: str | None = None,
 ) -> pd.DataFrame:
-    """Read enriched daily bars for a ticker from the DB into a DataFrame."""
-    q = "SELECT * FROM prices_daily WHERE ticker = ?"
-    params: list = [ticker]
+    """读取某标的的原始日线,**即时计算指标后再按区间切片**。
+
+    指标(SMA/RSI 等)需要完整历史做滚动窗口预热,因此先在全量历史上计算,
+    再切到 [start, end],避免窗口起点出现整段 NaN。返回列含小写 OHLCV + 指标。
+    """
+    with connect() as conn:
+        df = pd.read_sql(
+            "SELECT * FROM prices_daily WHERE ticker = ? ORDER BY date",
+            conn, params=[ticker.upper()], parse_dates=["date"],
+        )
+    if df.empty:
+        return df
+
+    df = df.set_index("date")
+    df = add_metrics(df)
     if start:
-        q += " AND date >= ?"
-        params.append(start)
+        df = df.loc[str(start):]
     if end:
-        q += " AND date <= ?"
-        params.append(end)
-    q += " ORDER BY date"
-    with connect() as conn:
-        df = pd.read_sql(q, conn, params=params, parse_dates=["date"])
-    return df.set_index("date") if not df.empty else df
+        df = df.loc[:str(end)]
+    return df
 
 
-def list_tickers() -> list[str]:
-    """All tickers that currently have any daily rows."""
+def list_tickers(market: str | None = None) -> list[str]:
+    """有日线数据的全部标的;传 market 则按市场过滤。"""
+    q = "SELECT DISTINCT ticker FROM prices_daily"
+    params: list = []
+    if market:
+        q += " WHERE market = ?"
+        params.append(market.upper())
+    q += " ORDER BY ticker"
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT ticker FROM prices_daily ORDER BY ticker"
-        ).fetchall()
+        rows = conn.execute(q, params).fetchall()
     return [r["ticker"] for r in rows]
 
 
-def _daily_to_rows(ticker: str, df: pd.DataFrame) -> list[tuple]:
+def _daily_to_rows(ticker: str, df: pd.DataFrame, market: str = "US") -> list[tuple]:
+    t = ticker.upper()
+    market = market.upper()
     out: list[tuple] = []
     for ts, row in df.iterrows():
         out.append(
             (
-                ticker,
+                t,
                 ts.date().isoformat(),
-                _f(row.get("Open")),
-                _f(row.get("High")),
-                _f(row.get("Low")),
-                _f(row.get("Close")),
-                _i(row.get("Volume")),
-                _f(row.get("SMA_20")),
-                _f(row.get("SMA_50")),
-                _f(row.get("SMA_200")),
-                _f(row.get("EMA_20")),
-                _f(row.get("Daily_Return")),
-                _f(row.get("Volatility_20")),
-                _f(row.get("RSI_14")),
-                _f(row.get("Vol_SMA_20")),
+                _f(row.get("open")),
+                _f(row.get("high")),
+                _f(row.get("low")),
+                _f(row.get("close")),
+                _i(row.get("volume")),
+                market,
             )
         )
     return out
