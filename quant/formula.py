@@ -17,6 +17,7 @@ import pandas as pd
 
 from . import mytt
 from .db import connect
+from .models import Formula
 from .prices import load_daily
 
 # 白名单函数命名空间(来自 mytt.__all__)
@@ -55,17 +56,21 @@ def scan(
     tickers: list[str],
     mode: str = "latest",
     lookback: int = 1,
+    loader=None,
 ) -> pd.DataFrame:
     """对每个标的求值并汇总命中结果。
 
     mode='latest': 仅看最新一根 K 线;
     mode='recent': 最近 lookback 根内任意一根命中即算命中。
+    loader: 自定义加载函数(默认 load_daily)。在 Streamlit 中传入 @st.cache_data
+            包装版本可避免重复读 SQLite + 重算指标。
     返回列: ticker, last_close, match_date, status。
     """
+    _load = loader or load_daily
     rows: list[dict] = []
     for t in tickers:
         try:
-            df = load_daily(t)
+            df = _load(t)
             if df.empty:
                 rows.append({"ticker": t, "last_close": None, "match_date": None,
                              "status": "无数据"})
@@ -90,43 +95,32 @@ def scan(
 
 
 # ---------------------------------------------------------------------------
-# 公式持久化 (formulas 表)
+# 公式持久化 (formulas 表) —— Peewee
 # ---------------------------------------------------------------------------
 def save_formula(name: str, expr: str, description: str | None = None) -> int:
-    """新增或覆盖同名公式,返回行 id。"""
+    """新增或覆盖同名公式,返回行 id。
+
+    Peewee 的 `insert(...).on_conflict_replace()` 在 SQLite 上等价于
+    `INSERT OR REPLACE`,正好覆盖「同名 -> 重写」语义。
+    """
     now = datetime.now().isoformat(timespec="seconds")
-    with connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO formulas (name, expr, description, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                expr = excluded.expr,
-                description = excluded.description,
-                created_at = excluded.created_at
-            """,
-            (name, expr, description, now),
-        )
-        conn.commit()
-        if cur.lastrowid:
-            return cur.lastrowid
-        row = conn.execute("SELECT id FROM formulas WHERE name = ?", (name,)).fetchone()
-        return row["id"] if row else -1
+    Formula.insert(
+        name=name, expr=expr, description=description, created_at=now,
+    ).on_conflict_replace().execute()
+    f = Formula.get_or_none(Formula.name == name)
+    return int(f.id) if f else -1
 
 
 def list_formulas() -> pd.DataFrame:
-    with connect() as conn:
-        return pd.read_sql("SELECT * FROM formulas ORDER BY name", conn)
+    """列出全部已存公式 -> DataFrame(供 UI 表格用)。"""
+    return pd.read_sql("SELECT * FROM formulas ORDER BY name", connect())
 
 
-def get_formula(name: str) -> dict | None:
-    with connect() as conn:
-        row = conn.execute("SELECT * FROM formulas WHERE name = ?", (name,)).fetchone()
-    return dict(row) if row else None
+def get_formula(name: str) -> Formula | None:
+    """按名称取一条 -> `Formula` 实例,或 None。"""
+    return Formula.get_or_none(Formula.name == name)
 
 
 def delete_formula(name: str) -> bool:
-    with connect() as conn:
-        cur = conn.execute("DELETE FROM formulas WHERE name = ?", (name,))
-        conn.commit()
-        return cur.rowcount > 0
+    """按名称删除。返回是否删了一行。"""
+    return Formula.delete().where(Formula.name == name).execute() > 0

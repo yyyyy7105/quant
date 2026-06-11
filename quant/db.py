@@ -1,146 +1,46 @@
-"""SQLite connection helper + schema bootstrap.
+"""SQLite 连接与初始化(Peewee 之上的薄壳)。
 
-All other modules import `connect()` and run their queries through that. The first
-call creates `data/quant.db` and applies the schema.
+模式 = 一个进程内共享的 `DB = SqliteDatabase(...)`,所有模型挂在它上面。
+对外仍暴露 `connect()` 返回**底层的 `sqlite3.Connection`**,这样:
+  - `pd.read_sql(query, connect())` 直接可用(pandas + DBAPI 连接)
+  - `quant.prices.fetch_daily` 的批量 `INSERT OR REPLACE` / `executemany` 也照旧
+首次调用 `connect()` 时会执行:
+  1. 用 `DB.create_tables(ALL_MODELS, safe=True)` 建表(IF NOT EXISTS,幂等)
+  2. 执行 `_migrate()` 修补老库形态(老指标列、市场字段、旧短名索引等)
 """
 
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
-from typing import Iterator
+
+from peewee import SqliteDatabase
 
 from . import DATA_DIR, DB_PATH
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS prices_daily (
-    ticker          TEXT NOT NULL,
-    date            TEXT NOT NULL,            -- ISO date (YYYY-MM-DD)
-    open            REAL,
-    high            REAL,
-    low             REAL,
-    close           REAL,
-    volume          INTEGER,
-    market          TEXT NOT NULL DEFAULT 'US',  -- 'US' | 'CN'
-    PRIMARY KEY (ticker, date)
-);
--- NOTE: technical indicators (sma/ema/rsi/macd/kdj/boll) are computed on the fly
--- in quant.metrics at load time, NOT stored here. Only raw OHLCV is persisted.
+# 单进程共享数据库;`connect()` 会确保 connection 已打开
+DB = SqliteDatabase(
+    str(DB_PATH),
+    pragmas={"foreign_keys": 1},
+    autoconnect=True,                # Peewee 默认 True,显式说明
+)
 
-CREATE TABLE IF NOT EXISTS prices_intraday (
-    ticker      TEXT NOT NULL,
-    ts          TEXT NOT NULL,                -- ISO timestamp
-    interval    TEXT NOT NULL,                -- '5m', '15m', '1h', ...
-    open        REAL,
-    high        REAL,
-    low         REAL,
-    close       REAL,
-    volume      INTEGER,
-    PRIMARY KEY (ticker, ts, interval)
-);
+_schema_applied = False
 
-CREATE TABLE IF NOT EXISTS trades (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT NOT NULL,                -- ISO timestamp
-    ticker      TEXT NOT NULL,
-    side        TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
-    qty         REAL NOT NULL,
-    price       REAL NOT NULL,
-    fees        REAL NOT NULL DEFAULT 0,
-    notes       TEXT,
-    tags        TEXT                          -- comma-separated
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT NOT NULL,
-    ticker      TEXT NOT NULL,
-    kind        TEXT NOT NULL,                -- 'manual'|'earnings'|'dividend'|'news'|'anomaly'
-    title       TEXT,
-    body        TEXT,
-    source_url  TEXT,
-    metadata    TEXT,                         -- JSON blob
-    dedupe_key  TEXT UNIQUE                   -- prevent duplicate auto-pulls
-);
-
-CREATE TABLE IF NOT EXISTS tickers (
-    ticker      TEXT PRIMARY KEY,
-    added_at    TEXT NOT NULL,
-    active      INTEGER NOT NULL DEFAULT 1,   -- 0 = removed (history kept)
-    notes       TEXT,
-    market      TEXT NOT NULL DEFAULT 'US'    -- 'US' | 'CN'
-);
-
-CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    username    TEXT NOT NULL UNIQUE,
-    pw_hash     TEXT NOT NULL,                -- PBKDF2-HMAC-SHA256
-    pw_salt     TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS backtests (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at      TEXT NOT NULL,
-    ticker          TEXT NOT NULL,
-    strategy        TEXT NOT NULL,
-    params_json     TEXT NOT NULL,
-    start_date      TEXT,
-    end_date        TEXT,
-    init_cash       REAL NOT NULL,
-    fees            REAL NOT NULL,
-    total_return    REAL,
-    annualized_return REAL,
-    sharpe          REAL,
-    max_drawdown    REAL,
-    win_rate        REAL,
-    num_trades      INTEGER,
-    avg_trade_pct   REAL,
-    bh_total_return REAL,
-    bh_max_drawdown REAL,
-    notes           TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_backtests_ticker ON backtests(ticker, created_at);
-
-CREATE TABLE IF NOT EXISTS fetch_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    op          TEXT NOT NULL,                -- 'fetch_daily' | 'pull_earnings' | etc.
-    ts          TEXT NOT NULL,                -- ISO timestamp when op finished
-    details     TEXT                          -- e.g. "3 tickers, 0 new rows"
-);
-CREATE INDEX IF NOT EXISTS idx_fetch_log_op ON fetch_log(op, ts);
-
-CREATE TABLE IF NOT EXISTS formulas (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    expr        TEXT NOT NULL,                -- MyTT-format boolean expression
-    description TEXT,
-    created_at  TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_trades_tt ON trades(ticker, ts);
-CREATE INDEX IF NOT EXISTS idx_events_tt ON events(ticker, ts);
-CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-"""
-
-
+# 加载时已落库过的「指标列」(旧 schema)。出现任一即触发 prices_daily 重建。
 _LEGACY_INDICATOR_COLS = {
     "sma_20", "sma_50", "sma_200", "ema_20",
     "daily_return", "volatility_20", "rsi_14", "vol_sma_20",
 }
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
-
-    # Migration: drop total_cost column from trades if it still exists
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对老 DB 的一次性命令式修补。每条迁移都需自检前置条件,不重复执行。"""
+    # 1) trades: 删除老的 total_cost 派生列
     tcols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
     if "total_cost" in tcols:
         conn.execute("ALTER TABLE trades DROP COLUMN total_cost")
 
-    # Migration: prices_daily now stores raw OHLCV only (indicators computed on
-    # the fly) + a `market` column. Rebuild the table if legacy indicator columns
-    # are still present; otherwise just add `market` if missing.
+    # 2) prices_daily: 指标改为加载时即时计算,不再落库。检测到旧指标列则重建。
     pcols = {row[1] for row in conn.execute("PRAGMA table_info(prices_daily)").fetchall()}
     if pcols & _LEGACY_INDICATOR_COLS:
         conn.executescript(
@@ -165,34 +65,50 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     elif "market" not in pcols:
         conn.execute("ALTER TABLE prices_daily ADD COLUMN market TEXT NOT NULL DEFAULT 'US'")
 
-    # Migration: add `market` to tickers if missing
+    # 3) tickers: 补 market 列
     tkcols = {row[1] for row in conn.execute("PRAGMA table_info(tickers)").fetchall()}
     if "market" not in tkcols:
         conn.execute("ALTER TABLE tickers ADD COLUMN market TEXT NOT NULL DEFAULT 'US'")
 
+    # 4) 老索引名清理 —— Peewee 用 `<model>_<cols>` 命名(如 `trade_ticker_ts`),
+    #    把历史两版命名都丢掉,让 Peewee 一套命名来源。
+    for old_name in (
+        # 最早期的手写短名
+        "idx_trades_tt", "idx_events_tt", "idx_events_kind",
+        "idx_fetch_log_op", "idx_backtests_ticker",
+        # 上一版自动生成的 idx_<table>_<cols>
+        "idx_trades_ticker_ts", "idx_events_ticker_ts",
+        "idx_fetch_log_op_ts", "idx_backtests_ticker_created_at",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {old_name}")
+
     conn.commit()
 
 
-def connect() -> sqlite3.Connection:
-    """Open (or create) the project SQLite DB with the schema applied."""
+def _ensure_schema() -> None:
+    """惰性初始化:首次调用 `connect()` 时建表 + 跑迁移。后续调用零成本。"""
+    global _schema_applied
+    if _schema_applied:
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    from . import models  # 惰性导入,避免循环
+    if DB.is_closed():
+        DB.connect()
+    DB.create_tables(models.ALL_MODELS, safe=True)
+    _migrate(DB.connection())
+    _schema_applied = True
+
+
+def connect() -> sqlite3.Connection:
+    """返回底层 `sqlite3.Connection`(Peewee 共享的同一连接)。
+
+    为兼容 `pd.read_sql(query, connect())` 和 `quant.prices` 的 `executemany`,
+    我们暴露 DBAPI 连接而不是 Peewee 的高阶 API。Peewee 配的 `row_factory` 是
+    `sqlite3.Row`,所以 `row["col"]` 也能用。
+    """
+    _ensure_schema()
+    if DB.is_closed():
+        DB.connect()
+    conn = DB.connection()
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    _ensure_schema(conn)
     return conn
-
-
-@contextmanager
-def cursor() -> Iterator[sqlite3.Cursor]:
-    """Convenience context manager: commits on success, rolls back on error."""
-    conn = connect()
-    try:
-        cur = conn.cursor()
-        yield cur
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()

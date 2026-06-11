@@ -8,6 +8,7 @@ dependencies = [
     "akshare>=1.18.64",
     "lxml>=6.1.1",
     "pandas>=3.0.3",
+    "peewee>=4.0.6",
     "plotly>=6.8.0",
     "streamlit>=1.58.0",
     "vectorbt>=0.28.2",

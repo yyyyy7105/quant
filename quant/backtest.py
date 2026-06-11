@@ -11,6 +11,7 @@ import pandas as pd
 import vectorbt as vbt
 
 from .db import connect
+from .models import Backtest
 from .prices import load_daily
 from .strategies import STRATEGIES
 
@@ -138,29 +139,26 @@ def _persist(
     init_cash: float, fees: float,
     metrics: dict, notes: str | None,
 ) -> int:
-    created = datetime.now().isoformat(timespec="seconds")
-    with connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO backtests (
-                created_at, ticker, strategy, params_json,
-                start_date, end_date, init_cash, fees,
-                total_return, annualized_return, sharpe, max_drawdown,
-                win_rate, num_trades, avg_trade_pct,
-                bh_total_return, bh_max_drawdown, notes
-            ) VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?, ?,?, ?)
-            """,
-            (
-                created, ticker.upper(), strategy, json.dumps(params),
-                start, end, init_cash, fees,
-                metrics["total_return"], metrics["annualized_return"],
-                metrics["sharpe"], metrics["max_drawdown"],
-                metrics["win_rate"], metrics["num_trades"], metrics["avg_trade_pct"],
-                metrics["bh_total_return"], metrics["bh_max_drawdown"], notes,
-            ),
-        )
-        conn.commit()
-        return cur.lastrowid
+    """落库一次回测配置 + 指标。返回新行 id。"""
+    bt = Backtest.create(
+        created_at=datetime.now().isoformat(timespec="seconds"),
+        ticker=ticker.upper(),
+        strategy=strategy,
+        params_json=json.dumps(params),
+        start_date=start, end_date=end,
+        init_cash=init_cash, fees=fees,
+        total_return=metrics["total_return"],
+        annualized_return=metrics["annualized_return"],
+        sharpe=metrics["sharpe"],
+        max_drawdown=metrics["max_drawdown"],
+        win_rate=metrics["win_rate"],
+        num_trades=metrics["num_trades"],
+        avg_trade_pct=metrics["avg_trade_pct"],
+        bh_total_return=metrics["bh_total_return"],
+        bh_max_drawdown=metrics["bh_max_drawdown"],
+        notes=notes,
+    )
+    return int(bt.id)
 
 
 def list_backtests(ticker: str | None = None) -> pd.DataFrame:
@@ -178,39 +176,38 @@ def list_backtests(ticker: str | None = None) -> pd.DataFrame:
 
 
 def get_backtest(backtest_id: int) -> dict | None:
-    """Return the stored config dict (enough to re-run) or None."""
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM backtests WHERE id = ?", (backtest_id,)
-        ).fetchone()
-    if not row:
+    """返回一次回测的配置 dict(够 re-run),不存在则 None。
+
+    内部用 `Backtest`(Peewee model)取值,外部仍保留 dict 形态:CLI/UI 直接
+    消费 dict 比 model 更方便(尤其是嵌套的 `metrics`)。
+    """
+    bt = Backtest.get_or_none(Backtest.id == backtest_id)
+    if bt is None:
         return None
     return {
-        "id":         row["id"],
-        "ticker":     row["ticker"],
-        "strategy":   row["strategy"],
-        "params":     json.loads(row["params_json"]),
-        "start":      row["start_date"],
-        "end":        row["end_date"],
-        "init_cash":  row["init_cash"],
-        "fees":       row["fees"],
-        "notes":      row["notes"],
+        "id":         bt.id,
+        "ticker":     bt.ticker,
+        "strategy":   bt.strategy,
+        "params":     json.loads(bt.params_json),
+        "start":      bt.start_date,
+        "end":        bt.end_date,
+        "init_cash":  bt.init_cash,
+        "fees":       bt.fees,
+        "notes":      bt.notes,
         "metrics": {
-            "total_return":      row["total_return"],
-            "annualized_return": row["annualized_return"],
-            "sharpe":            row["sharpe"],
-            "max_drawdown":      row["max_drawdown"],
-            "win_rate":          row["win_rate"],
-            "num_trades":        row["num_trades"],
-            "avg_trade_pct":     row["avg_trade_pct"],
-            "bh_total_return":   row["bh_total_return"],
-            "bh_max_drawdown":   row["bh_max_drawdown"],
+            "total_return":      bt.total_return,
+            "annualized_return": bt.annualized_return,
+            "sharpe":            bt.sharpe,
+            "max_drawdown":      bt.max_drawdown,
+            "win_rate":          bt.win_rate,
+            "num_trades":        bt.num_trades,
+            "avg_trade_pct":     bt.avg_trade_pct,
+            "bh_total_return":   bt.bh_total_return,
+            "bh_max_drawdown":   bt.bh_max_drawdown,
         },
     }
 
 
 def delete_backtest(backtest_id: int) -> bool:
-    with connect() as conn:
-        cur = conn.execute("DELETE FROM backtests WHERE id = ?", (backtest_id,))
-        conn.commit()
-        return cur.rowcount > 0
+    """按 id 删一条回测。返回是否删了一行。"""
+    return Backtest.delete().where(Backtest.id == backtest_id).execute() > 0

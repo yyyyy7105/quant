@@ -1,6 +1,6 @@
-"""User authentication: register (CLI-only) and verify (app login).
+"""用户认证 (`users` 表) —— Peewee CRUD + PBKDF2-HMAC-SHA256 哈希。
 
-Passwords are hashed with PBKDF2-HMAC-SHA256 (stdlib, no extra deps).
+密码用 stdlib `hashlib.pbkdf2_hmac(SHA-256)`,无外部依赖。
 """
 
 from __future__ import annotations
@@ -9,13 +9,15 @@ import hashlib
 import os
 from datetime import datetime
 
-from .db import connect
+from peewee import IntegrityError
 
-_ITERATIONS = 600_000  # OWASP recommendation for PBKDF2-SHA256
+from .models import User
+
+_ITERATIONS = 600_000  # PBKDF2-SHA256 的 OWASP 推荐迭代数
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
-    """Return (hex_hash, hex_salt)."""
+    """返回 `(hex_hash, hex_salt)`。"""
     if salt is None:
         salt = os.urandom(32)
     h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _ITERATIONS)
@@ -23,69 +25,53 @@ def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
 
 
 def register(username: str, password: str) -> bool:
-    """Create a new user. Returns True on success, False if username taken."""
+    """新建用户。成功返回 True;用户名已存在(UNIQUE 冲突)返回 False。"""
     pw_hash, pw_salt = _hash_password(password)
-    ts = datetime.now().isoformat(timespec="seconds")
     try:
-        with connect() as conn:
-            conn.execute(
-                "INSERT INTO users (username, pw_hash, pw_salt, created_at) VALUES (?, ?, ?, ?)",
-                (username.lower(), pw_hash, pw_salt, ts),
-            )
-            conn.commit()
+        User.create(
+            username=username.lower(),
+            pw_hash=pw_hash, pw_salt=pw_salt,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
         return True
-    except Exception:
+    except IntegrityError:
         return False
+
+
+def get_user(username: str) -> User | None:
+    """按用户名取一条 -> `User`(含 hash/salt)或 None。"""
+    return User.get_or_none(User.username == username.lower())
 
 
 def verify(username: str, password: str) -> bool:
-    """Check username + password. Returns True if valid."""
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT pw_hash, pw_salt FROM users WHERE username = ?",
-            (username.lower(),),
-        ).fetchone()
-    if not row:
+    """校验用户名+密码,返回是否匹配。"""
+    user = get_user(username)
+    if user is None:
         return False
-    stored_hash = row["pw_hash"]
-    salt = bytes.fromhex(row["pw_salt"])
-    candidate_hash, _ = _hash_password(password, salt)
-    return candidate_hash == stored_hash
+    candidate_hash, _ = _hash_password(password, bytes.fromhex(user.pw_salt))
+    return candidate_hash == user.pw_hash
 
 
 def change_password(username: str, new_password: str) -> bool:
-    """Reset a user's password. Returns True if the user existed."""
+    """重置密码。返回用户是否存在。"""
     pw_hash, pw_salt = _hash_password(new_password)
-    with connect() as conn:
-        cur = conn.execute(
-            "UPDATE users SET pw_hash = ?, pw_salt = ? WHERE username = ?",
-            (pw_hash, pw_salt, username.lower()),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+    n = (User
+         .update(pw_hash=pw_hash, pw_salt=pw_salt)
+         .where(User.username == username.lower())
+         .execute())
+    return n > 0
 
 
 def delete_user(username: str) -> bool:
-    """Remove a user. Returns True if the user existed."""
-    with connect() as conn:
-        cur = conn.execute(
-            "DELETE FROM users WHERE username = ?", (username.lower(),)
-        )
-        conn.commit()
-        return cur.rowcount > 0
+    """删除用户。返回用户是否存在(并被删)。"""
+    return User.delete().where(User.username == username.lower()).execute() > 0
 
 
-def list_users() -> list[dict]:
-    """Return all users (username + created_at, no secrets)."""
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT username, created_at FROM users ORDER BY created_at"
-        ).fetchall()
-    return [{"username": r["username"], "created_at": r["created_at"]} for r in rows]
+def list_users() -> list[User]:
+    """列出全部用户 -> `User` 列表(含 hash/salt;CLI 仅展示 username/created_at)。"""
+    return list(User.select().order_by(User.created_at))
 
 
 def has_users() -> bool:
-    """Return True if at least one user is registered."""
-    with connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-    return row["n"] > 0
+    """是否至少注册了一个用户(决定是否启用登录门禁)。"""
+    return User.select().count() > 0

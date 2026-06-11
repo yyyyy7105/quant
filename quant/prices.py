@@ -10,6 +10,7 @@ import yfinance as yf
 
 from .db import connect
 from .metrics import add_metrics
+from .models import PriceDaily
 from .oplog import record as record_op
 from .sources import cn as cn_source
 from .sources import us as us_source
@@ -29,29 +30,58 @@ INTRADAY_MAX_DAYS = {
 # prices_daily 仅存原始 OHLCV + market;指标在 load_daily 时即时计算
 _DAILY_COLS = ["ticker", "date", "open", "high", "low", "close", "volume", "market"]
 
+# 日线只保留多少年的历史:fetch_daily 完成后自动裁剪。10y 对应大部分指标的
+# warm-up 余量(SMA_200 ~ 1y、绝大多数策略只看最近几年),库不会无限增长。
+DAILY_RETENTION_YEARS = 10
+
+
+def prune_daily_before(years: int = DAILY_RETENTION_YEARS) -> int:
+    """删除 `prices_daily` 中早于 `years` 年的行,返回被删行数。
+
+    用 Peewee 的 `delete().where(...).execute()` —— 一条 SQL,无需 Python 侧迭代。
+    返回 0 表示无行可删(也不写 oplog,避免噪音)。
+    """
+    cutoff = (datetime.now() - timedelta(days=365 * years)).date().isoformat()
+    n = PriceDaily.delete().where(PriceDaily.date < cutoff).execute()
+    if n:
+        print(f"[OK]   prune: removed {n} prices_daily rows before {cutoff}")
+        record_op("prune_daily", f"{n} rows removed before {cutoff}")
+    return n
+
 
 def fetch_daily(
-    tickers: Iterable[str], period: str = "5y", market: str = "US"
+    tickers: Iterable[str], period: str = "5y", market: str = "US",
+    *, prune: bool = True,
+    on_progress: "Callable[[int, int, str], None] | None" = None,
 ) -> dict[str, int]:
-    """按市场拉取日线原始 OHLCV 并写入 `prices_daily`(不再落库指标)。
+    """按市场拉取日线原始 OHLCV 并写入 `prices_daily`。
 
     market='US' 走 yfinance,'CN' 走 akshare(前复权)。返回 {ticker: rows_written}。
+    `prune=True`(默认):成功写入后自动调用 `prune_daily_before()`,把超出
+    `DAILY_RETENTION_YEARS` 的老行清掉。如需保留全量历史(测试 / 重建),传 prune=False。
+    `on_progress(i, total, ticker)`: 每完成一个标的后回调,用于 UI 进度条。
     """
     market = market.upper()
     source = cn_source if market == "CN" else us_source
+    tickers = list(tickers)
+    total = len(tickers)
 
     written: dict[str, int] = {}
     with connect() as conn:
-        for ticker in tickers:
+        for idx, ticker in enumerate(tickers):
             try:
                 df = source.fetch_history(ticker, period=period)
             except Exception as e:  # 单个标的失败不影响其它
                 print(f"[WARN] {ticker} ({market}): fetch failed: {e}")
                 written[ticker] = 0
+                if on_progress:
+                    on_progress(idx + 1, total, ticker)
                 continue
             if df is None or df.empty:
                 print(f"[WARN] {ticker} ({market}): no data returned")
                 written[ticker] = 0
+                if on_progress:
+                    on_progress(idx + 1, total, ticker)
                 continue
 
             rows = _daily_to_rows(ticker, df, market)
@@ -67,8 +97,12 @@ def fetch_daily(
                 f"{df.index[0].date()} -> {df.index[-1].date()}, "
                 f"latest Close={df['close'].iloc[-1]:.2f}"
             )
+            if on_progress:
+                on_progress(idx + 1, total, ticker)
     total_rows = sum(written.values())
     record_op("fetch_daily", f"{len(written)} tickers, {total_rows} rows")
+    if prune:
+        prune_daily_before()
     return written
 
 

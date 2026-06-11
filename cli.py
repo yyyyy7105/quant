@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("(no users registered)")
             else:
                 for u in users:
-                    print(f"  {u['username']:20s}  registered {u['created_at']}")
+                    print(f"  {u.username:20s}  registered {u.created_at}")
             return 0
         if args.user_cmd == "delete":
             ok = auth.delete_user(args.username)
